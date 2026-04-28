@@ -1,0 +1,26 @@
+data/
+*.parquet
+*.csv
+*.p
+*.h5
+*.sql
+
+# --- Python Environment ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+.env
+
+# --- IDE & OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Research Results ---
+results/
+plots/
+*.log
