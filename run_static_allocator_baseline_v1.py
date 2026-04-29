@@ -352,16 +352,11 @@ def align_month_inputs(
     month_end: pd.Timestamp,
     pred_month: pd.DataFrame,
     cov_data: CovarianceData,
-    returns_next: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
-    """Align mu, covariance, and realized-return availability in covariance order."""
+    """Align month-t mu and covariance in the covariance file's permno order."""
     pred_lookup = pred_month.set_index("permno")["mu_hat"]
-    next_return_permnos = set(returns_next.loc[returns_next["retadj"].notna(), "permno"])
     keep_mask = np.array(
-        [
-            permno in pred_lookup.index and permno in next_return_permnos
-            for permno in cov_data.permnos
-        ],
+        [permno in pred_lookup.index for permno in cov_data.permnos],
         dtype=bool,
     )
     selected_positions = np.flatnonzero(keep_mask)
@@ -615,7 +610,7 @@ def run_backtest(
 
         try:
             cov_data = load_covariance_npz(cov_path, month_end)
-            permnos, mu, cov, _, vols = align_month_inputs(month_end, pred_month, cov_data, returns_next)
+            permnos, mu, cov, _, vols = align_month_inputs(month_end, pred_month, cov_data)
         except Exception as exc:
             LOGGER.warning("Skipping %s: failed to align inputs: %s", month_end.date(), exc)
             continue
