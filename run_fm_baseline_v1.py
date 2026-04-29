@@ -341,8 +341,11 @@ def make_oos_predictions(
 
     for idx in range(train_window, len(months)):
         forecast_month = months[idx]
-        past_months = months[idx - train_window : idx]
-        coef_window = beta_lookup.loc[beta_lookup.index.intersection(past_months)]
+        window_start = months[idx - train_window]
+        window_end = months[idx - 1]
+        coef_window = beta_lookup.loc[
+            (beta_lookup.index >= window_start) & (beta_lookup.index < forecast_month)
+        ]
         if coef_window.empty:
             LOGGER.warning(
                 "Skipping forecast month %s: no valid coefficient estimates in prior %s months.",
@@ -359,6 +362,12 @@ def make_oos_predictions(
                 train_window,
             )
 
+        if not (coef_window.index < forecast_month).all():
+            raise AssertionError(
+                f"Lookahead violation: coefficient window for {forecast_month} "
+                "contains forecast-month or future coefficients."
+            )
+
         coef_bar = aggregate_coefficients(coef_window, feature_cols, coef_aggregation)
         month_df = panel.loc[panel["month_end"].eq(forecast_month)].copy()
         if month_df.empty:
@@ -371,8 +380,21 @@ def make_oos_predictions(
         month_df["mu_hat"] = mu_hat
         month_df["realized_target"] = month_df[target_col]
         month_df["n_coef_months"] = len(coef_window)
+        month_df["coef_window_start"] = window_start
+        month_df["coef_window_end"] = window_end
         prediction_frames.append(
-            month_df[["permno", "month_end", "mu_hat", "realized_target", "n_coef_months"] + feature_cols]
+            month_df[
+                [
+                    "permno",
+                    "month_end",
+                    "mu_hat",
+                    "realized_target",
+                    "n_coef_months",
+                    "coef_window_start",
+                    "coef_window_end",
+                ]
+                + feature_cols
+            ]
         )
 
     if not prediction_frames:
