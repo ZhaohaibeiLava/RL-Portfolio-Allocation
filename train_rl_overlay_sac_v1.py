@@ -45,6 +45,7 @@ SOLVER_CHOICES = ("CLARABEL", "ECOS", "SCS", "OSQP")
 SUCCESS_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
 LAMBDA_RANGE = (0.1, 50.0)
 TAU_RANGE = (0.0, 0.01)
+MISSING_RETURN_WEIGHT_WARN_TOL = 1e-8
 
 
 @dataclass(frozen=True)
@@ -625,10 +626,17 @@ def evaluate_next_return(
         return None
     if not observed_mask.all():
         missing_weight = float(weights.loc[~observed_mask].sum())
-        LOGGER.warning(
-            "%s next-month returns are partially missing for optimizer holdings; "
-            "renormalizing over observed subset for return evaluation. Missing weight: %.6f",
+        missing_count = int((~observed_mask).sum())
+        log_fn = (
+            LOGGER.warning
+            if missing_weight > MISSING_RETURN_WEIGHT_WARN_TOL
+            else LOGGER.debug
+        )
+        log_fn(
+            "%s next-month returns are partially missing for %s optimizer holdings; "
+            "renormalizing over observed subset for return evaluation. Missing weight: %.12f",
             month_end.date(),
+            f"{missing_count:,}",
             missing_weight,
         )
     eval_weights = weights.loc[observed_mask].astype(float)
