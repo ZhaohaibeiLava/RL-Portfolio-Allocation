@@ -271,6 +271,8 @@ def write_summary_text(path: Path, summary: pd.DataFrame) -> None:
                 f"Mean IC minus test: {row.mean_ic_minus_test:.6f}",
                 f"Mean rank IC minus test: {row.mean_rank_ic_minus_test:.6f}",
                 f"Mean top-bottom spread minus test: {row.mean_top_bottom_spread_minus_test:.6f}",
+                f"Annualized top-bottom spread minus test: {row.annualized_top_bottom_spread_minus_test:.6f}",
+                f"Spread Sharpe minus test: {row.spread_sharpe_minus_test:.6f}",
                 f"Average mu_std minus test: {row.average_mu_std_minus_test:.6f}",
                 f"Average p90_minus_p10 minus test: {row.average_p90_minus_p10_minus_test:.6f}",
                 "",
