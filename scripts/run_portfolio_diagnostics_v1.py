@@ -37,7 +37,11 @@ def parse_month(value: str | None) -> pd.Timestamp | None:
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Generate portfolio diagnostics for one strategy.")
-    parser.add_argument("--strategy-name", required=True, choices=("static_allocator", "rl_overlay_sac", "static_fixed_param"))
+    parser.add_argument(
+        "--strategy-name",
+        required=True,
+        choices=("static_allocator", "rl_overlay_sac", "static_fixed_param", "static_fixed_param_fair"),
+    )
     parser.add_argument("--backtest-file", required=True)
     parser.add_argument("--weights-file", required=True)
     parser.add_argument("--outdir", default="data/diagnostics/portfolio")

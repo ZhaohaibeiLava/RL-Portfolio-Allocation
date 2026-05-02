@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Run a fixed-parameter static benchmark using RL-implied lambda and tau.
+"""Run a fair fixed-parameter static benchmark.
 
-This diagnostic answers whether the SAC overlay mainly added value by changing
-parameters through time, or whether its average parameter choice is already a
-better static allocator configuration.
+The benchmark selects one fixed lambda/tau pair using train or validation action
+history only, then evaluates that pair on the held-out test period.
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ LOGGER = logging.getLogger("run_static_fixed_parameter_benchmark")
 
 PARQUET_COMPRESSION = "snappy"
 SOLVER_CHOICES = ("CLARABEL", "ECOS", "SCS", "OSQP")
+FIXED_PARAM_SOURCES = ("train_mean", "validation_mean", "manual")
 SUCCESS_STATUSES = {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
 
 
@@ -69,15 +69,32 @@ def parse_month(value: str | None) -> pd.Timestamp | None:
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run a static allocator benchmark using fixed lambda/tau from RL action history."
+        description="Run a fair fixed-parameter static allocator benchmark."
     )
     parser.add_argument("--project-root", default=".", help="Project root. Default: .")
     parser.add_argument("--pred-file", default="data/prediction/fm_oos_predictions.parquet")
     parser.add_argument("--risk-dir", default="data/risk/risk_cov_npz")
     parser.add_argument("--risk-meta-file", default="data/risk/risk_monthly_metadata.csv")
     parser.add_argument("--returns-file", default="data/panel/monthly_stock_panel_basic_full.parquet")
-    parser.add_argument("--action-history-file", default="data/rl_overlay_sac/test_action_history.csv")
-    parser.add_argument("--outdir", default="data/diagnostics/static_fixed_param")
+    parser.add_argument("--train-action-history-file", default="data/rl_overlay_sac/train_action_history.csv")
+    parser.add_argument("--validation-action-history-file", default="data/rl_overlay_sac/validation_action_history.csv")
+    parser.add_argument(
+        "--test-action-history-file",
+        default=None,
+        help="Optional test action history used only for diagnostics; never for parameter selection.",
+    )
+    parser.add_argument(
+        "--action-history-file",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--fixed-param-source",
+        default="validation_mean",
+        choices=FIXED_PARAM_SOURCES,
+        help="How to choose fixed lambda/tau. Default: validation_mean.",
+    )
+    parser.add_argument("--outdir", default="data/diagnostics/static_fixed_param_fair")
     parser.add_argument("--fixed-lambda", type=float, default=None)
     parser.add_argument("--fixed-tau", type=float, default=None)
     parser.add_argument("--cost-bps", type=float, default=10.0)
@@ -188,35 +205,110 @@ def clean_returns(returns: pd.DataFrame) -> pd.DataFrame:
     return result[["permno", "month_end", "retadj"]].sort_values(["month_end", "permno"])
 
 
-def infer_fixed_parameters(
-    action_history_file: Path,
+def read_action_history(path: Path, dataset_name: str) -> pd.DataFrame:
+    """Read an action-history CSV and validate lambda/tau columns."""
+    if not path.exists():
+        raise FileNotFoundError(f"{dataset_name} file not found: {path}")
+    actions = pd.read_csv(path)
+    require_columns(actions, ["lambda_t", "tau_t"], dataset_name)
+    if "month_end" in actions.columns:
+        actions = normalize_month_end(actions, dataset_name)
+    actions["lambda_t"] = pd.to_numeric(actions["lambda_t"], errors="coerce")
+    actions["tau_t"] = pd.to_numeric(actions["tau_t"], errors="coerce")
+    actions = actions.dropna(subset=["lambda_t", "tau_t"]).copy()
+    if actions.empty:
+        raise ValueError(f"{dataset_name} has no rows with finite lambda_t and tau_t.")
+    return actions
+
+
+def mean_action_parameters(
+    path: Path,
+    dataset_name: str,
+    selection_end_exclusive: pd.Timestamp | None,
+) -> tuple[float, float]:
+    """Compute mean lambda/tau from one action-history file."""
+    actions = read_action_history(path, dataset_name)
+    if selection_end_exclusive is not None and "month_end" in actions.columns:
+        before = len(actions)
+        actions = actions.loc[actions["month_end"] < selection_end_exclusive].copy()
+        LOGGER.info(
+            "Using %s of %s %s rows before %s for fixed-parameter selection.",
+            f"{len(actions):,}",
+            f"{before:,}",
+            dataset_name,
+            selection_end_exclusive.date(),
+        )
+    elif selection_end_exclusive is not None:
+        LOGGER.warning(
+            "%s has no month_end column; cannot date-filter before %s. "
+            "Assuming this file is already pre-test.",
+            dataset_name,
+            selection_end_exclusive.date(),
+        )
+    if actions.empty:
+        raise ValueError(f"{dataset_name} has no action rows available before the test window.")
+    lambda_value = float(actions["lambda_t"].mean())
+    tau_value = float(actions["tau_t"].mean())
+    if not np.isfinite(lambda_value) or not np.isfinite(tau_value):
+        raise ValueError(f"Could not infer finite fixed lambda/tau from {dataset_name}.")
+    return lambda_value, tau_value
+
+
+def select_fixed_parameters(
+    fixed_param_source: str,
+    train_action_history_file: Path,
+    validation_action_history_file: Path,
     fixed_lambda: float | None,
     fixed_tau: float | None,
     test_start: pd.Timestamp | None,
-    test_end: pd.Timestamp | None,
-) -> tuple[float, float]:
-    """Use CLI overrides when present; otherwise infer means from RL action history."""
-    if fixed_lambda is not None and fixed_tau is not None:
-        return float(fixed_lambda), float(fixed_tau)
-    if not action_history_file.exists():
-        raise FileNotFoundError(
-            f"Action history file not found: {action_history_file}. Provide --fixed-lambda and --fixed-tau."
+) -> tuple[float, float, str]:
+    """Select fixed parameters without using test-period action history."""
+    if fixed_param_source == "manual":
+        if fixed_lambda is None or fixed_tau is None:
+            raise ValueError("--fixed-lambda and --fixed-tau are required when --fixed-param-source=manual.")
+        return float(fixed_lambda), float(fixed_tau), "manual"
+
+    if fixed_lambda is not None or fixed_tau is not None:
+        raise ValueError("--fixed-lambda/--fixed-tau may only be used when --fixed-param-source=manual.")
+
+    if fixed_param_source == "train_mean":
+        lambda_value, tau_value = mean_action_parameters(train_action_history_file, "train action history", test_start)
+        return lambda_value, tau_value, "train_mean"
+    if fixed_param_source == "validation_mean":
+        lambda_value, tau_value = mean_action_parameters(
+            validation_action_history_file,
+            "validation action history",
+            test_start,
         )
-    actions = pd.read_csv(action_history_file)
-    require_columns(actions, ["lambda_t", "tau_t"], "action history file")
-    if "month_end" in actions.columns:
-        actions = normalize_month_end(actions, "action history file")
-        if test_start is not None:
-            actions = actions.loc[actions["month_end"] >= test_start]
-        if test_end is not None:
-            actions = actions.loc[actions["month_end"] <= test_end]
-        if actions.empty:
-            raise ValueError("No action-history rows remain after applying the requested test window.")
-    lambda_value = float(fixed_lambda) if fixed_lambda is not None else float(pd.to_numeric(actions["lambda_t"], errors="coerce").mean())
-    tau_value = float(fixed_tau) if fixed_tau is not None else float(pd.to_numeric(actions["tau_t"], errors="coerce").mean())
-    if not np.isfinite(lambda_value) or not np.isfinite(tau_value):
-        raise ValueError("Could not infer finite fixed lambda/tau from action history.")
-    return lambda_value, tau_value
+        return lambda_value, tau_value, "validation_mean"
+
+    raise ValueError(f"Unsupported fixed parameter source: {fixed_param_source}")
+
+
+def optional_test_action_summary(path: Path | None) -> dict[str, float | int | str]:
+    """Compute optional test-action diagnostics without using them for parameter selection."""
+    if path is None:
+        return {
+            "test_action_history_file": "",
+            "test_action_n_rows": 0,
+            "test_action_mean_lambda": np.nan,
+            "test_action_mean_tau": np.nan,
+        }
+    if not path.exists():
+        LOGGER.warning("Optional test action history file not found: %s", path)
+        return {
+            "test_action_history_file": str(path),
+            "test_action_n_rows": 0,
+            "test_action_mean_lambda": np.nan,
+            "test_action_mean_tau": np.nan,
+        }
+    actions = read_action_history(path, "test action history")
+    return {
+        "test_action_history_file": str(path),
+        "test_action_n_rows": int(len(actions)),
+        "test_action_mean_lambda": float(actions["lambda_t"].mean()),
+        "test_action_mean_tau": float(actions["tau_t"].mean()),
+    }
 
 
 def discover_covariance_files(risk_dir: Path) -> dict[pd.Timestamp, Path]:
@@ -378,7 +470,15 @@ def max_drawdown(nav: pd.Series) -> float:
     return float((clean / running_peak - 1.0).min())
 
 
-def compute_summary(backtest: pd.DataFrame, attempted_months: int, fixed_lambda: float, fixed_tau: float) -> dict[str, float | int | str]:
+def compute_summary(
+    backtest: pd.DataFrame,
+    attempted_months: int,
+    fixed_lambda: float,
+    fixed_tau: float,
+    fixed_param_source: str,
+    parameter_source_file: Path | None,
+    test_action_diagnostics: dict[str, float | int | str],
+) -> dict[str, float | int | str]:
     """Compute scalar performance diagnostics."""
     successes = backtest.loc[backtest["solver_status"].isin(SUCCESS_STATUSES)].copy()
     net = successes["net_return"].astype(float) if not successes.empty else pd.Series(dtype=float)
@@ -386,8 +486,10 @@ def compute_summary(backtest: pd.DataFrame, attempted_months: int, fixed_lambda:
     net_vol = float(net.std(ddof=1) * np.sqrt(12.0)) if len(net) > 1 else np.nan
     sharpe = float(net.mean() / net.std(ddof=1) * np.sqrt(12.0)) if len(net) > 1 and net.std(ddof=1) > 0 else np.nan
     return {
-        "strategy": "static_fixed_param",
+        "strategy": "static_fixed_param_fair",
         "date_range": f"{successes['month_end'].min().date()} to {successes['month_end'].max().date()}" if not successes.empty else "n/a",
+        "fixed_param_source": fixed_param_source,
+        "parameter_source_file": str(parameter_source_file) if parameter_source_file is not None else "",
         "annualized_return": annualized_return(net),
         "annualized_gross_return": annualized_return(gross),
         "annualized_volatility": net_vol,
@@ -400,15 +502,18 @@ def compute_summary(backtest: pd.DataFrame, attempted_months: int, fixed_lambda:
         "attempted_months": int(attempted_months),
         "fixed_lambda": float(fixed_lambda),
         "fixed_tau": float(fixed_tau),
+        **test_action_diagnostics,
     }
 
 
 def write_summary_text(path: Path, summary: dict[str, float | int | str]) -> None:
     """Write a human-readable summary."""
     lines = [
-        "Static Fixed-Parameter Benchmark Summary",
+        "Fair Static Fixed-Parameter Benchmark Summary",
         "",
         f"Date range: {summary['date_range']}",
+        f"Fixed parameter source: {summary['fixed_param_source']}",
+        f"Parameter source file: {summary['parameter_source_file']}",
         f"Fixed lambda used: {summary['fixed_lambda']}",
         f"Fixed tau used: {summary['fixed_tau']}",
         f"Attempted months: {summary['attempted_months']}",
@@ -420,6 +525,8 @@ def write_summary_text(path: Path, summary: dict[str, float | int | str]) -> Non
         f"Cumulative return: {summary['cumulative_return']:.6f}",
         f"Mean monthly turnover: {summary['mean_monthly_turnover']:.6f}",
         f"Mean n_assets: {summary['mean_n_assets']:.2f}",
+        f"Optional test action mean lambda: {summary['test_action_mean_lambda']:.6f}",
+        f"Optional test action mean tau: {summary['test_action_mean_tau']:.6f}",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -573,20 +680,40 @@ def run_pipeline(args: argparse.Namespace) -> None:
     risk_dir = resolve_path(project_root, args.risk_dir)
     risk_meta_file = resolve_path(project_root, args.risk_meta_file)
     returns_file = resolve_path(project_root, args.returns_file)
-    action_history_file = resolve_path(project_root, args.action_history_file)
+    train_action_history_file = resolve_path(project_root, args.train_action_history_file)
+    validation_action_history_file = resolve_path(project_root, args.validation_action_history_file)
+    test_action_history_arg = args.test_action_history_file or args.action_history_file
+    test_action_history_file = (
+        resolve_path(project_root, test_action_history_arg)
+        if test_action_history_arg is not None
+        else None
+    )
     outdir = resolve_path(project_root, args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    fixed_lambda, fixed_tau = infer_fixed_parameters(
-        action_history_file,
+    fixed_lambda, fixed_tau, fixed_param_source = select_fixed_parameters(
+        args.fixed_param_source,
+        train_action_history_file,
+        validation_action_history_file,
         args.fixed_lambda,
         args.fixed_tau,
         args.test_start,
-        args.test_end,
     )
+    parameter_source_file = {
+        "train_mean": train_action_history_file,
+        "validation_mean": validation_action_history_file,
+        "manual": None,
+    }[fixed_param_source]
+    test_action_diagnostics = optional_test_action_summary(test_action_history_file)
+
     if fixed_lambda < 0 or fixed_tau < 0:
         raise ValueError("Fixed lambda and tau must be nonnegative.")
-    LOGGER.info("Using fixed lambda %.8f and fixed tau %.8f.", fixed_lambda, fixed_tau)
+    LOGGER.info(
+        "Using fixed lambda %.8f and fixed tau %.8f from %s.",
+        fixed_lambda,
+        fixed_tau,
+        fixed_param_source,
+    )
 
     predictions = clean_predictions(read_parquet_file(pred_file, "prediction file"))
     returns = clean_returns(read_parquet_file(returns_file, "return panel"))
@@ -600,15 +727,23 @@ def run_pipeline(args: argparse.Namespace) -> None:
     LOGGER.info("Backtest month range: %s to %s (%s months).", months[0].date(), months[-1].date(), len(months))
 
     weights, backtest = run_backtest(months, predictions, returns, cov_files, fixed_lambda, fixed_tau, args)
-    summary = compute_summary(backtest, len(months), fixed_lambda, fixed_tau)
+    summary = compute_summary(
+        backtest,
+        len(months),
+        fixed_lambda,
+        fixed_tau,
+        fixed_param_source,
+        parameter_source_file,
+        test_action_diagnostics,
+    )
 
-    backtest.to_csv(outdir / "static_fixed_backtest.csv", index=False)
-    weights.to_parquet(outdir / "static_fixed_weights.parquet", index=False, compression=PARQUET_COMPRESSION)
-    pd.DataFrame([summary]).to_csv(outdir / "static_fixed_summary.csv", index=False)
-    write_summary_text(outdir / "static_fixed_summary.txt", summary)
-    plot_series(backtest, "cumulative_nav", "Static Fixed-Parameter Cumulative NAV", "Cumulative NAV", outdir / "static_fixed_cumret.png")
-    plot_series(backtest, "turnover", "Static Fixed-Parameter Monthly Turnover", "L1 turnover", outdir / "static_fixed_turnover.png")
-    plot_series(backtest, "n_assets", "Static Fixed-Parameter Universe Size", "Number of assets", outdir / "static_fixed_n_assets.png")
+    backtest.to_csv(outdir / "static_fixed_fair_backtest.csv", index=False)
+    weights.to_parquet(outdir / "static_fixed_fair_weights.parquet", index=False, compression=PARQUET_COMPRESSION)
+    pd.DataFrame([summary]).to_csv(outdir / "static_fixed_fair_summary.csv", index=False)
+    write_summary_text(outdir / "static_fixed_fair_summary.txt", summary)
+    plot_series(backtest, "cumulative_nav", "Fair Static Fixed-Parameter Cumulative NAV", "Cumulative NAV", outdir / "static_fixed_fair_cumret.png")
+    plot_series(backtest, "turnover", "Fair Static Fixed-Parameter Monthly Turnover", "L1 turnover", outdir / "static_fixed_fair_turnover.png")
+    plot_series(backtest, "n_assets", "Fair Static Fixed-Parameter Universe Size", "Number of assets", outdir / "static_fixed_fair_n_assets.png")
 
     LOGGER.info("Done. Annualized return %.4f, Sharpe %.4f.", summary["annualized_return"], summary["sharpe_ratio"])
 
