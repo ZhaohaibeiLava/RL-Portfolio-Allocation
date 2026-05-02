@@ -4,6 +4,7 @@ data/
 *.p
 *.h5
 *.sql
+*.pdf
 
 # --- Python Environment ---
 __pycache__/
