@@ -14,11 +14,12 @@ import logging
 import os
 import random
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 import matplotlib
 

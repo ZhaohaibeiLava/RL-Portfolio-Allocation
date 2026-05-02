@@ -16,8 +16,16 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Iterable
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
+
+import matplotlib
+
+matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
